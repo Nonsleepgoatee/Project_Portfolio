@@ -1,0 +1,399 @@
+---
+title: "Biobank Project In R"
+author: "Chung-Kai Chou"
+date: "2023-12-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(stats)
+library(gridExtra)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(pROC)
+```
+```{r}
+dt=read.csv('Bonus_Midterm_data_setA.csv')
+dim(dt)
+```
+```{r}
+sapply(dt, class)
+```
+```{r}
+colSums(is.na(dt))
+```
+```{r}
+summary(dt)
+```
+```{r}
+dt_num=dt%>%select(age,townsend_deprivation_index,bmi_0,cholesterol_0,MET_activity)
+par(mfrow = c(2, 3),mar=c(1,3,2,2))
+invisible(lapply(names(dt_num), function(x) {
+    boxplot(dt_num[[x]], main = x)
+}))
+```
+```{r}
+getmode = function(v) {
+   uniqv = unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+```
+
+
+```{r}
+dt$ethnicity_group[dt$ethnicity_group==997|dt$ethnicity_group==999]=getmode(dt$ethnicity_group)
+dt$smoking_status_0[dt$smoking_status_0==9]=getmode(dt$smoking_status_0)
+dt$alcohol_status_0[dt$alcohol_status_0==9]=getmode(dt$alcohol_status_0)
+cat_col=c('sex','ethnicity_group','education_college_university_0','smoking_status_0','alcohol_status_0',
+          'dementia_all_outcome','MI_all_outcome','stroke_all_outcome')
+for (i in cat_col){
+  dt[[i]]=as.factor(dt[[i]])
+}
+cat_his = lapply(cat_col, function(col) {
+    ggplot(dt, aes_string(x = col)) + 
+        geom_bar() + 
+        labs(title = paste("Histogram of", col), x = col, y = "Count")
+})
+grid.arrange(grobs = cat_his, ncol = 3, nrow = 3)
+```
+
+# Project : Analysis of Multimorbidity relationship with composite lifestyle
+**Statement**: Investigating the association between composite lifestyle factors (like smoking, alcohol consumption, physical activity) and the multimorbidity (Dementia, MI, Stroke).
+
+**Research Question**: How do composite lifestyle factors such as smoking, alcohol consumption, and physical activity influence the risk of multimorbidity, specifically the co-occurrence of dementia, myocardial infarction (MI), and stroke in adults?
+
+**Steps**:\
+1. Building Life style score matrix and Mutilmorbidity score matrix.
+
+2. Exploratory Data Analysis and Statistical Testing
+
+3. Logistic Regression Model of the Impact of Lifestyle score on Multimorbidity
+
+## Matrix Building
+**Lifestyle Composite Score Matrix Building**:\
+In this part, I get the concept from a article at Journal of Multimorbidity & Comorbidity that study "the Relationship between multimorbidity and composite lifestyle status in Shenzhen, China". In the article, the researchers cut the life factor into three levels, transformed into composite score, and calculated the score by using an algorithm that summarized the sub-scores from multiple life style factors and use this composite score to understand its relation with multimorbidity, which is define as two or more chronic diseases coexisting in a single person. So my calculation is to separate each factor into three levels: Healthy(2pt), Normal(1pt), and Bad(0pt).\
+
+* BMI:\
+  + BMI<=18.5(Underweight): Normal(1pt)\
+  + BMI>18.5 and <=25(Normal): Healthy(2pt)\
+  + BMI>25 and <=30(Overweight): Normal(1pt)\
+  + BMI>30(Obese): Bad(0pt)\
+* Activity:\
+  + MET_Activity>=150: Healthy(2pt)\
+  + MET_Activity<150: Normal(1pt)\
+  + MET_Actovoty=0: Bad(0pt)\
+* Alcohol Status:\
+  + Alcohol=0(No Habit): Healthy(2pt)\
+  + Alcohol=1(Past Habit): Normal(1pt)\
+  + Alcohol=2(Current Habit): Bad(0pt)\
+* Smoking Status:\
+  + Smoking=0(No Habit): Healthy(2pt)\
+  + Smoking=1(Past Habit): Normal(1pt)\
+  + Smoking=2(Current Habit): Bad(0pt)
+
+For Multimorbidity calculation, I just simply sum up all three conditions outcome: Dementia, Myocardial Infarction (heart attack), and Stroke Outcome. If the total of three conditions over 2, then it should be consider as multimorbidity.
+
+```{r}
+lifestyle_calculator=function(bmi,activity,alcohol,smoking){
+  score=0
+  score=score+ifelse(bmi<18.5,1,ifelse(bmi<25,2,ifelse(bmi<30,1,0)))
+  score=score+ifelse(activity>=150,2,ifelse(activity>0,1,0))
+  score=score+ifelse(alcohol==0,2,ifelse(alcohol==1,1,0))
+  score=score+ifelse(smoking==0,2,ifelse(smoking==1,1,0))
+  return(score)
+}
+```
+```{r}
+dt$AlcoholNum = as.numeric(as.character(dt$alcohol_status_0))
+dt$SmokingNum = as.numeric(as.character(dt$smoking_status_0))
+dt$lifestyle_score=apply(dt,1,function(row)lifestyle_calculator(row['bmi_0'],row['MET_activity'],row['AlcoholNum'],row['SmokingNum']))
+```
+**Multimorbidity calculate**
+```{r}
+dt$dementiaNum=as.numeric(as.character(dt$dementia_all_outcome))
+dt$MINum=as.numeric(as.character(dt$MI_all_outcome))
+dt$strokeNum=as.numeric(as.character(dt$stroke_all_outcome))
+dt$mmb=with(dt, as.integer(dementiaNum > 0) +
+                      as.integer(MINum > 0) +
+                      as.integer(strokeNum > 0))
+```
+```{r}
+dt_final=dt%>% select(-c(ID,AlcoholNum,SmokingNum,dementiaNum,MINum,strokeNum))
+```
+
+## Exploratory Data Analysis
+Before we get to the final model, I think explore the relation of each factor with each condition outcome would be helpful for more insight and infomation on this study.
+```{r}
+breaks = c(39, 49, 59, Inf)
+labels = c("40-49", "50-59", "60+")
+dt_final$age_group = cut(dt$age, breaks = breaks, labels = labels, include.lowest = TRUE)
+```
+
+**Age group with All Condition Outcome**:\
+In order to observe the outcome proportion difference between each groups, using the stacked bar would be ideal. From the graph, we can tell all three outcomes have the same pattern that the proportion of condition outcome goes up while the age goes up. And the Chi-squared test of three outcomes also prove that there's statistically significant difference for age groups with p-value nearly 0.
+```{r}
+d=ggplot(dt_final,aes(x=age_group,fill=dementia_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Dementia", "With Dementia"))+
+  labs(title = "Dementia Proportion by Age group", x = "Age group", y = "Proportion")
+m=ggplot(dt_final,aes(x=age_group,fill=MI_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No MI", "With MI"))+
+  labs(title = "MI Proportion by Age group", x = "Age group", y = "Proportion")
+s=ggplot(dt_final,aes(x=age_group,fill=stroke_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Stroke", "With Stroke"))+
+  labs(title = "Stroke Proportion by Age group", x = "Age group", y = "Proportion")
+grid.arrange(d,m,s,ncol=2)
+```
+```{r}
+con_col=c('dementia_all_outcome','MI_all_outcome','stroke_all_outcome')
+for (i in con_col){
+  res=chisq.test(table(dt_final$age_group,dt_final[[i]]))
+  cat("Results for", i, ":\n")
+  print(res)
+  cat("\n")
+}
+```
+**Gender with All Condition Outcome**:\
+From the graph, we cannot really tell there's much difference between male and female for the dementia outcome. With the Chi-squared test result of p-value over 0.05(0.119) proving that we do not have enough evidence to against the null hypothesis that there's no statistically significant between male and female.\
+For Myocardial Infarction and Stroke condition, the graph shows that the male has higher proportion of condition outcome happen and with theChi-squared test result p-value below 0.05(<2.2e-16 and =5.889e-05) proving that we have enough evidence to against the null hypothesis and say there is statistically significant between male and female.
+```{r}
+d=ggplot(dt_final,aes(x=sex,fill=dementia_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Dementia", "With Dementia"))+
+  labs(title = "Dementia Proportion by Gender", x = "Gender", y = "Proportion")
+m=ggplot(dt_final,aes(x=sex,fill=MI_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No MI", "With MI"))+
+  labs(title = "MI Proportion by Gender", x = "Gender", y = "Proportion")
+s=ggplot(dt_final,aes(x=sex,fill=stroke_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Stroke", "With Stroke"))+
+  labs(title = "Stroke Proportion by Gender", x = "Gender", y = "Proportion")
+grid.arrange(d,m,s,ncol=2)
+```
+```{r}
+for (i in con_col){
+  res=chisq.test(table(dt_final$sex,dt_final[[i]]))
+  cat("Results for", i, ":\n")
+  print(res)
+  cat("\n")
+}
+```
+**BMI with All condition Outcome**:\
+From the graph, we cannot really tell there's much difference in box structure between the dementia outcome. With the Logistic Regression test result of p-value over 0.05(0.2579898) proving that we do not have enough evidence to against the null hypothesis that there's no statistically significant between the dementia outcome.\
+For Myocardial Infarction and Stroke condition, the graph shows that the people with either MI or Stroke has higher median of BMI the Logistic Regression test result p-value below 0.05(1.978395e-15  and 2.81729e-07) proving that we have enough evidence to against the null hypothesis and say there is statistically significant between both the MI and the Stroke outcome.
+```{r}
+d=ggplot(dt_final, aes(x = dementia_all_outcome, y = bmi_0)) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("No dementia", "With Dementia"))+
+  labs(title = "Boxplot of BMI by Dementia Status",
+       x = "Dementia Status",
+       y = "BMI")
+m=ggplot(dt_final, aes(x = MI_all_outcome, y = bmi_0)) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("No MI", "With MI"))+
+  labs(title = "Boxplot of BMI by MI Status",
+       x = "MI Status",
+       y = "BMI")
+s=ggplot(dt_final, aes(x = stroke_all_outcome, y = bmi_0)) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("No Stroke", "With Stroke"))+
+  labs(title = "Boxplot of BMI by Stroke Status",
+       x = "Stroke Status",
+       y = "BMI")
+grid.arrange(d,m,s,ncol=2)
+```
+```{r}
+for (i in con_col){
+  mdl_res=glm(formula = as.formula(paste(i,'~bmi_0')),data=dt_final,family = "binomial")
+  mdl_sum=summary(mdl_res)
+  bmi_p=mdl_sum$coefficients['bmi_0','Pr(>|z|)']
+  cat("Results for", i, ":\n")
+  cat("P-value for BMI: ", bmi_p, "\n\n")
+}
+```
+**MET_activity with All condition Outcome**:\
+Combining the observation of the graph with the Logistic Regression test result, we can tell there's no significant difference for all three outcomes.
+```{r}
+d=ggplot(dt_final, aes(x = dementia_all_outcome, y = MET_activity)) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("No dementia", "With Dementia"))+
+  labs(title = "Boxplot of MET_activity by Dementia Status",
+       x = "Dementia Status",
+       y = "MET_activity")
+m=ggplot(dt_final, aes(x = MI_all_outcome, y = MET_activity)) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("No MI", "With MI"))+
+  labs(title = "Boxplot of MET_activity by MI Status",
+       x = "MI Status",
+       y = "MET_activity")
+s=ggplot(dt_final, aes(x = stroke_all_outcome, y = MET_activity)) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("No Stroke", "With Stroke"))+
+  labs(title = "Boxplot of MET_activity by Stroke Status",
+       x = "Stroke Status",
+       y = "MET_activity")
+grid.arrange(d,m,s,ncol=2)
+```
+```{r}
+for (i in con_col){
+  mdl_res=glm(formula = as.formula(paste(i,'~MET_activity')),data=dt_final,family = "binomial")
+  mdl_sum=summary(mdl_res)
+  bmi_p=mdl_sum$coefficients['MET_activity','Pr(>|z|)']
+  cat("Results for", i, ":\n")
+  cat("P-value for MET_activity: ", bmi_p, "\n\n")
+}
+```
+**Smoking Status and All Condition Outcome**:\
+The graph showing that people with current smoking habit have higher proportion of MI outcome than other two groups, with the test p-value below 0,05 (3.987e-08) proving there's statiscally significant difference between groups. The other two condition outcome (Dementia and Stroke) do not show the difference neither from graph nor the test result.
+```{r}
+d=ggplot(dt_final,aes(x=smoking_status_0,fill=dementia_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_x_discrete(labels=c("Never", "Previous",'Current'))+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Dementia", "With Dementia"))+
+  labs(title = "Dementia Proportion by Smoking", x = "Smoking Status", y = "Proportion")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.title = element_blank())
+m=ggplot(dt_final,aes(x=smoking_status_0,fill=MI_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_x_discrete(labels=c("Never", "Previous",'Current'))+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No MI", "With MI"))+
+  labs(title = "MI Proportion by Smoking", x = "Smoking Status", y = "Proportion")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.title = element_blank())
+s=ggplot(dt_final,aes(x=smoking_status_0,fill=stroke_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_x_discrete(labels=c("Never", "Previous",'Current'))+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Stroke", "With Stroke"))+
+  labs(title = "Stroke Proportion by Smoking", x = "Smoking Status", y = "Proportion")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.title = element_blank())
+grid.arrange(d,m,s,ncol=2)
+```
+```{r}
+for (i in con_col){
+  res=chisq.test(table(dt_final$smoking_status_0,dt_final[[i]]))
+  cat("Results for", i, ":\n")
+  print(res)
+  cat("\n")
+}
+```
+**Alcohol Status and All Condition Outcome**:\
+Except the Dementia doesn't show the significant difference between alcohol status groups, the other two condition outcomes shows significant with p-value below 0.05 (0.004413 and 0.001467). However, it's weird that current alcohol habit group have lower proportion for both MI and Stroke outcome.
+```{r}
+d=ggplot(dt_final,aes(x=alcohol_status_0,fill=dementia_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_x_discrete(labels=c("Never", "Previous",'Current'))+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Dementia", "With Dementia"))+
+  labs(title = "Dementia Proportion by Alcohol", x = "Alcohol Status", y = "Proportion")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.title = element_blank())
+m=ggplot(dt_final,aes(x=alcohol_status_0,fill=MI_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_x_discrete(labels=c("Never", "Previous",'Current'))+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No MI", "With MI"))+
+  labs(title = "MI Proportion by Alcohol", x = "Alcohol Status", y = "Proportion")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.title = element_blank())
+s=ggplot(dt_final,aes(x=alcohol_status_0,fill=stroke_all_outcome))+
+  geom_bar(position = "fill")+
+  scale_x_discrete(labels=c("Never", "Previous",'Current'))+
+  scale_fill_manual(values=c("red", "blue"),
+                     labels=c("No Stroke", "With Stroke"))+
+  labs(title = "Stroke Proportion by Alcohol", x = "Alcohol Status", y = "Proportion")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.title = element_blank())
+grid.arrange(d,m,s,ncol=2)
+```
+```{r}
+for (i in con_col){
+  res=chisq.test(table(dt_final$alcohol_status_0,dt_final[[i]]))
+  cat("Results for", i, ":\n")
+  print(res)
+  cat("\n")
+}
+```
+
+## Life Style and Multimorbidity Comparision
+Next, I want to see the life style and multimorbidity score would be different for each factor/groups.\
+**Life style score and Multimorbidity comparison between Age group**:\
+We can clearly see the age group of 40-49 has highest lifestyle mean score and lowest multimorbidity mean score among all age groups whereas the age group of over 60 has lowest lifestyle mean score and highest multimorbidity mean score. The anova test result shows that the lifestyle and multimorbidity score have significant different between age groups with p-value below 0.05(4.44e-05 and <2e-16).
+```{r}
+ggplot(dt_final, aes(x = age_group, y = lifestyle_score)) + 
+  geom_bar(stat = "summary", fun = "mean") + 
+  labs(title = "Average Lifestyle Score by Age Group", x = "Age Group", y = "Average Lifestyle Score")
+
+ggplot(dt_final, aes(x = age_group, y = mmb)) + 
+  geom_bar(stat = "summary", fun = "mean") + 
+  labs(title = "Average Multimorbidity Score by Age Group", x = "Age Group", y = "Average Multimorbidity Score")
+```
+```{r}
+anova_result = aov(lifestyle_score ~ age_group, data = dt_final)
+sum_ls=summary(anova_result)
+
+anova_result_mm = aov(mmb ~ age_group, data = dt_final)
+sum_mm=summary(anova_result_mm)
+cat("Results for Lifestyle",":\n")
+print(sum_ls)
+cat("\n")
+cat("Results for Multimorbidity",":\n")
+print(sum_mm)
+```
+**Life style score and Multimorbidity comparison between Gender**:\
+We can clearly see the female has higher lifestyle mean score and lower multimorbidity mean score than male whereas the male has lower lifestyle mean score and higher multimorbidity mean score. The anova test result shows that the lifestyle and multimorbidity score have significant different between male and female with p-value below 0.05( both <2e-16).
+```{r}
+ggplot(dt_final, aes(x = sex, y = lifestyle_score)) + 
+  geom_bar(stat = "summary", fun = "mean") + 
+  labs(title = "Average Lifestyle Score by Gender", x = "Gender", y = "Average Lifestyle Score")
+
+ggplot(dt_final, aes(x = sex, y = mmb)) + 
+  geom_bar(stat = "summary", fun = "mean") + 
+  labs(title = "Average Multimorbidity Score by Gender", x = "Gender", y = "Average Multimorbidity Score")
+```
+```{r}
+t_ls = t.test(lifestyle_score ~ sex, data = dt_final)
+t_mm = t.test(mmb ~ sex, data = dt_final)
+cat("Results for Lifestyle",":\n")
+print(t_ls)
+cat("\n")
+cat("Results for Multimorbidity",":\n")
+print(t_mm)
+```
+
+
+## Logistic Model on the impact of lifestyle scores on multimorbidity
+From our model result, the coefficient of lifestyle is -0.19941, meaning that with each unit increase in the lifestyle score, the log odds of having multimorbidity decreases, implying a protective effect of a higher lifestyle score against multimorbidity. With p-value below 0.05(0.0386), indicating that the relationship between lifestyle_score and multimorbidity is statistically significant. Overall, we can conclude that higher lifestyle score is associated with a lower likelihood of having multimorbidity.
+```{r}
+dt_final$mmb_bi=ifelse(dt_final$mmb>=2,1,0)
+log_model = glm(mmb_bi ~ lifestyle_score, data = dt_final, family = "binomial")
+summary(log_model)
+```
+```{r}
+predicted_values = ifelse(predict(log_model, type = "response") > 0.5, 1, 0)
+confusionMatrix(factor(predicted_values), factor(dt_final$mmb_bi))
+```
+```{r}
+roc_response = roc(dt_final$mmb_bi, fitted(log_model))
+plot(roc_response)
+auc(roc_response)
+```
+
+
+
